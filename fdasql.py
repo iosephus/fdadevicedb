@@ -147,7 +147,9 @@ def download_zipped_data(url_list, encoding=text_encoding):
     files in each URL should contain CSV files"""
     contents = [download_zipped_data_singleurl(url, encoding) for url in url_list]
     data_frame = pd.concat(contents)
-    return(data_frame.drop_duplicates())
+    data_frame.drop_duplicates(inplace=True)
+    data_frame.reset_index(inplace=True)
+    return(data_frame)
 
 # For direct use with SQLite3, not in use
 def get_applicant_id(conn, applicant):
@@ -186,6 +188,12 @@ def translate_column_names(columns):
     new_names = [name if name != 'type' else 'devicetype' for name in new_names]
     return(new_names)
 
+def clean_text(text):
+    result = re.sub("[\s]+", " ", text)
+    result = result.strip()
+    result = result.upper()
+    return(result)
+
 def download_fda_data(url_list):
     d = download_zipped_data(url_list)
     d.drop("SSPINDICATOR", inplace=True, axis=1)
@@ -197,6 +205,10 @@ def download_fda_data(url_list):
     d.loc[d.thirdparty == 'N', 'thirdparty'] = False
     d.loc[d.expeditedreview == 'Y', 'expeditedreview'] = True
     d.loc[d.expeditedreview == 'N', 'expeditedreview'] = False
+    for col in ['contact', 'applicant', 'street1', 'street2', 'city', 'devicename', 'devicetype']:
+        d[col] = [clean_text(a) if a is not None else a for a in d[col]]
+    for col in ['state', 'countrycode', 'zipcode', 'postalcode', 'decision', 'reviewadvisecomm', 'productcode', 'stateorsumm', 'classadvisecomm']:
+        d[col] = [a.strip() if a is not None else a for a in d[col]]
     return(d)
 
 def create_database(engine, dataframe):
