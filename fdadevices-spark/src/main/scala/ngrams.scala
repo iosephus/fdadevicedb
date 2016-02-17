@@ -25,6 +25,6 @@ object NGramsLibSimple extends NGramsLib {
     }
 
     def diceCoefficient(s1: Set[List[String]], s2: Set[List[String]]): Double = {
-	2.0 * (s1 union s2).size / (s1.size + s2.size)
+	2.0 * (s1 intersect s2).size / (s1.size + s2.size)
     }
 }
