@@ -5,6 +5,7 @@ import org.apache.spark.SparkConf
 
 import scopt.OptionParser
 import scala.math.random
+import fdadevices.nlp._
 
 object SimpleApp {
     def main(args: Array[String]) {
