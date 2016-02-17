@@ -17,6 +17,7 @@ import itertools
 from nltk.util import ngrams as nltk_ngrams
 import re
 from collections import namedtuple
+import numpy as np
 
 # For direct use with SQLite3, not in use
 sql_create_table_pmn_applicant = '''CREATE TABLE pmn_applicant (
@@ -53,11 +54,10 @@ sql_create_table_pmn_request = '''CREATE TABLE pmn_request (
 # This is what's really used: SQLAlchemy
 Base = sqladeclarative.declarative_base()
 
-class PMNApplicant(Base):
-    __tablename__ = 'pmn_applicant'
+class Applicant(Base):
+    __tablename__ = 'applicant'
     applicantid = sqla.Column(sqla.Integer, primary_key=True)
     applicant = sqla.Column(sqla.String(128), nullable=False)
-    contact = sqla.Column(sqla.String(64))
     street1 = sqla.Column(sqla.String(128))
     street2 = sqla.Column(sqla.String(128))
     city = sqla.Column(sqla.String(128))
@@ -66,11 +66,17 @@ class PMNApplicant(Base):
     postalcode = sqla.Column(sqla.String(16))
     countrycode = sqla.Column(sqla.String(2))
 
+class Contact(Base):
+    __tablename__ = 'contact'
+    contactid = sqla.Column(sqla.Integer, primary_key=True)
+    contact = sqla.Column(sqla.String(64))
+    applicantid = sqla.Column(sqla.Integer, sqla.ForeignKey('applicant.applicantid'))
+
 class PMNRequest(Base):
     __tablename__ = 'pmn_request'
     requestid = sqla.Column(sqla.Integer, primary_key=True)
     knumber = sqla.Column(sqla.String(16), nullable=False)
-    applicantid = sqla.Column(sqla.Integer, sqla.ForeignKey('pmn_applicant.applicantid'))
+    devicename = sqla.Column(sqla.String(512))
     datereceived = sqla.Column(sqla.Date)
     decisiondate = sqla.Column(sqla.Date)
     decision = sqla.Column(sqla.String(4), nullable=False)
@@ -81,7 +87,8 @@ class PMNRequest(Base):
     devicetype = sqla.Column(sqla.String(11))
     thirdparty = sqla.Column(sqla.Boolean)
     expeditedreview = sqla.Column(sqla.Boolean)
-    devicename = sqla.Column(sqla.String(512))
+    applicantid = sqla.Column(sqla.Integer, sqla.ForeignKey('applicant.applicantid'))
+    contactid = sqla.Column(sqla.Integer, sqla.ForeignKey('contact.contactid'))
 
 
 columns_request_df = ['knumber',
@@ -97,7 +104,7 @@ columns_request_df = ['knumber',
                    'expeditedreview',
                    'devicename']
 
-columns_company_df = ['applicant',
+columns_applicant_df = ['applicant',
                       'street1',
                       'street2',
                       'city',
@@ -106,7 +113,7 @@ columns_company_df = ['applicant',
                       'zipcode',
                       'postalcode']
 
-columns_applicant_df = columns_company_df + ['contact']
+columns_applicant_contacts_df = columns_applicant_df + ['contact']
 
 fda_url_pmn_lastmonth = [
     "http://www.accessdata.fda.gov/premarket/ftparea/pmnlstmn.zip"
@@ -173,7 +180,7 @@ def get_applicant_id(conn, applicant):
 # For direct use with SQLite3, not in use
 def insert_record(conn, row):
     request = row[columns_request_df]
-    applicant = row[columns_applicant_df]
+    applicant = row[columns_applicant_contacts_df]
     applicantid = get_applicant_id(conn, applicant)
     request_dict = dict(request[pd.notnull(request)])
     names = ', '.join(list(request_dict.keys()) + ['applicantid'])
@@ -211,14 +218,37 @@ def download_fda_data(url_list):
         d[col] = [a.strip() if a is not None else a for a in d[col]]
     return(d)
 
-def create_database(engine, dataframe):
+normdf = namedtuple('normdf', ['applicant', 'contact', 'pmn_request'])
+
+def normalize_fda_data(dataframe):
+    # Sort dataframe
+    pmn_request = dataframe.sort_values(by='decisiondate')
+    # Create dataframe with unique applicant contacts combinations
+    applicants_contacts = pmn_request[columns_applicant_contacts_df].drop_duplicates()
+    applicants_contacts['contactid'] = np.arange(1, len(applicants_contacts) + 1)
+    # Create dataframe with unique applicants
+    applicants = applicants_contacts[columns_applicant_df].drop_duplicates()
+    applicants['applicantid'] = np.arange(1, len(applicants) + 1)
+    applicants_contacts = applicants_contacts.merge(applicants, on=columns_applicant_df, how='left')
+    # Merge dataframes to add foreign indexes needed for normalization
+    pmn_request = pmn_request.merge(applicants_contacts, on=columns_applicant_contacts_df, how='left')
+    pmn_request['requestid'] = np.arange(1, len(pmn_request) + 1)
+    # Create normalized version by removing unneeded columns
+    applicant_norm = applicants[['applicantid'] + columns_applicant_df]
+    contact_norm = applicants_contacts[['contactid', 'contact', 'applicantid']]
+    pmn_request_norm = pmn_request[columns_request_df + ['applicantid'] + ['contactid']]
+
+    # Return results
+    result = normdf(applicant=applicant_norm, contact=contact_norm, pmn_request=pmn_request_norm)
+    return(result)
+
+
+def create_database(engine, norm_data):
+    # Create database
     Base.metadata.create_all(engine)
-    applicants = dataframe[columns_applicant_df].drop_duplicates()
-    applicants.to_sql('pmn_applicant', engine, if_exists='append', index=False)
-    applicant_readback = pd.read_sql_table('pmn_applicant', engine)
-    dataframe_merged = dataframe.merge(applicant_readback, on=columns_applicant_df, how='left')
-    dataframe_merged_tostore = dataframe_merged[columns_request_df + ['applicantid']].sort_values(by='decisiondate')
-    dataframe_merged_tostore.to_sql('pmn_request', engine, if_exists='append', index=False)
+    norm_data.applicant.to_sql('applicant', engine, if_exists='append', index=False)
+    norm_data.contact.to_sql('contact', engine, if_exists='append', index=False)
+    norm_data.pmn_request.to_sql('pmn_request', engine, if_exists='append', index=False)
 
 
 def get_applicant_name_text(row):
@@ -278,7 +308,6 @@ def compute_applicant_match_p(df, i1, i2):
     dice = (0.5 * dice_name + 0.5 * dice_addr)
     return(dice)
 
-
 def compute_applicant_match_p_wcontact(df, i1, i2):
     row1 = df.ix[i1]
     row2 = df.ix[i2]
@@ -335,7 +364,7 @@ def deduplicate_applicants(df, p = 0.7):
     sys.stdout.flush()
     start_time = time.time()
     print("Removing trivial duplicates")
-    df_companies = df.drop_duplicates(columns_company_df).copy()
+    df_companies = df.drop_duplicates(columns_applicant_df).copy()
     deduplicated_index = [None for i in df_companies.index]
     print("Computing name and address ngrams")
     ngrams_nt = precompute_ngrams(df_companies)
@@ -356,7 +385,7 @@ def deduplicate_applicants(df, p = 0.7):
     print("Wraping up")
     df_companies['companyid'] = [df_companies.ix[idx].applicantid for idx in deduplicated_index]
     df_companies_unique = df_companies.loc[list(set(deduplicated_index))].copy()
-    df2 = df.merge(df_companies, on=columns_company_df, how='left')
+    df2 = df.merge(df_companies, on=columns_applicant_df, how='left')
     df2['applicantid'] = df2.applicantid_x
     df2['contact'] = [re.sub('[\s]+', ' ', str(c)) for c in df2.contact_x]
     df_contact = df2[['applicantid', 'companyid', 'contact']].drop_duplicates(['companyid', 'contact'])
@@ -364,7 +393,7 @@ def deduplicate_applicants(df, p = 0.7):
     df_contact = df_contact[['contactid', 'contact', 'companyid']]
     df2 = df2.merge(df_contact, on=['companyid', 'contact'], how='left')
     df2 = df2[['applicantid', 'contactid', 'companyid']]
-    df_companies_unique = df_companies_unique[['companyid'] + columns_company_df]
+    df_companies_unique = df_companies_unique[['companyid'] + columns_applicant_df]
     print("Done. Took %f seconds" % (time.time() - start_time))
     return(df2, df_companies_unique, df_contact)
     
@@ -382,7 +411,12 @@ def main(argv):
     # Download data
     print("Downloading FDA records")
     start_time = time.time() 
-    d = download_fda_data(fda_url_pmn_all)
+    fda_data = download_fda_data(fda_url_pmn_all)
+    print("Done. Took %f seconds" % (time.time() - start_time))
+
+    print("Normalizing FDA data")
+    start_time = time.time() 
+    norm_fda_data = normalize_fda_data(fda_data)
     print("Done. Took %f seconds" % (time.time() - start_time))
 
     # Connect to database
@@ -393,7 +427,7 @@ def main(argv):
 
     print("Inserting records in database")
     start_time = time.time() 
-    create_database(engine, d)
+    create_database(engine, norm_data)
     print("Done. Took %f seconds" % (time.time() - start_time))
 
 
