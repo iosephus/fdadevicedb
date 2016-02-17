@@ -132,6 +132,10 @@ fda_url_pmn_pre1996 = [
 
 fda_url_pmn_all = fda_url_pmn_pre1996 + fda_url_pmn_1996curr
 
+fda_url_pmn_1986curr = ['http://www.accessdata.fda.gov/premarket/ftparea/pmn9195.zip',
+                        'http://www.accessdata.fda.gov/premarket/ftparea/pmn8690.zip'] + \
+		       fda_url_pmn_1996curr
+
 fda_url_pma = ["http://www.accessdata.fda.gov/premarket/ftparea/pma.zip"]
 text_encoding = 'cp1252'
 
@@ -411,7 +415,7 @@ def main(argv):
     # Download data
     print("Downloading FDA records")
     start_time = time.time() 
-    fda_data = download_fda_data(fda_url_pmn_all)
+    fda_data = download_fda_data(fda_url_pmn_1986curr)
     print("Done. Took %f seconds" % (time.time() - start_time))
 
     print("Normalizing FDA data")
@@ -427,7 +431,7 @@ def main(argv):
 
     print("Inserting records in database")
     start_time = time.time() 
-    create_database(engine, norm_data)
+    create_database(engine, norm_fda_data)
     print("Done. Took %f seconds" % (time.time() - start_time))
 
 
