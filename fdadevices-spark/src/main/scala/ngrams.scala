@@ -7,6 +7,7 @@ trait NGramsLib {
     def tokens(text: String): List[String]
     def nGrams(tokens: List[String], n: Int): List[List[String]]
     def uniqueNGrams(tokens: List[String], n: Int): Set[List[String]]
+    def uniqueNGrams(tokens: List[String], nvals: Set[Int]): Set[List[String]]
     def diceCoefficient(s1: Set[List[String]], s2: Set[List[String]]): Double
 }
 
@@ -22,6 +23,12 @@ object NGramsLibSimple extends NGramsLib {
 
     def uniqueNGrams(tokens: List[String], n: Int): Set[List[String]] = {
 	tokens.sliding(n, 1).toSet
+    }
+
+    def uniqueNGrams(tokens: List[String], nvals: Set[Int]): Set[List[String]] = {
+
+	val ngrams = for (n <- nvals) yield tokens.sliding(n, 1).toSet
+	ngrams.reduceLeft(_ union _)
     }
 
     def diceCoefficient(s1: Set[List[String]], s2: Set[List[String]]): Double = {
