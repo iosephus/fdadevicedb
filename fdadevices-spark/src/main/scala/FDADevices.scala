@@ -17,22 +17,24 @@ object SimpleApp {
         val conf = new SparkConf().setAppName("FDADevices")
         val sc = new SparkContext(conf)
 	val sqlContext = new SQLContext(sc)
-	val connInfo = Map("url" -> config.get.database, "dbtable" -> "pmn_applicant")
+	val connInfo = Map("url" -> config.get.database, "dbtable" -> "applicant")
 	val df = sqlContext.load("jdbc", connInfo)
 
-	println(df.show())
-
-	val slices = 6
-	val n = 10000000 * slices
-	val count = sc.parallelize(1 until n, slices).map { i =>
-	val x = random * 2 - 1
-	val y = random * 2 - 1
-	if (x*x + y*y < 1) 1 else 0
-	}.reduce(_ + _)
-	println("Pi is roughly " + 4.0 * count / n)
-	sc.stop()
+	
     }
     
+    def getApplicantNameTokens(row) = {
+	val commonSuffixes = Vector("corp", "inc", "llc", "co", "ltd", "gmbh")
+	val text = row.applicant.toLowerCase()
+	val tokens = NGramsLibSimple.tokens(text)
+	if (commonSuffixes contains tokens.last.replace(".", "")) v.slice(0, v.size - 1) else v
+    }
+
+    def getApplicantAddressTokens(row) {
+	row.select("street1", "street2", "city").filter(_ != null).map(toLowerCase).flatMap(NGramsLibSimple.tokens)
+    }
+
+
     val parser = new OptionParser[Config]("App") {
 
 	head("App", "")
