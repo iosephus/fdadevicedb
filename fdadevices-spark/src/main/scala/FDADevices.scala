@@ -26,38 +26,42 @@ object SimpleApp {
 	    println(result(i))
 	}
     }
-    
+   
+    def getValueFromRow[T](row: org.apache.spark.sql.Row, columnName: String): Option[T] = {
+	val o: Option[T] = Option(row.getAs[T](columnName))
+	o
+    }
+ 
     def getApplicantNameTokens(row: org.apache.spark.sql.Row): Vector[String] = {
 	val commonSuffixes = Vector("corp", "inc", "llc", "co", "ltd", "gmbh")
-	val text = row.getAs[String]("applicant").toLowerCase
-	val tokens = NGramsLibSimple.tokens(text)
+	val text = getValueFromRow[String]("applicant", row).map(_toLowerCase)
+	val tokens = match text {
+	    case Some(t) => NGramsLibSimple.tokens(t)
+	    case None => Vector[String]()
 	if (commonSuffixes contains tokens.last.replace(".", "")) tokens.slice(0, tokens.size - 1) else tokens
     }
 
-    def getApplicantPostalCode(row: org.apache.spark.sql.Row): String = {
-	if (row.getAs[String]("countrycode") ==  "US") {
-	    val code = row.getAs[String]("zipcode")
-	    if (code != null) code.take(5) else null
-	} else {
-	    row.getAs[String]("postalcode")
+    def getApplicantPostalCode(row: org.apache.spark.sql.Row): Option[String] = {
+	getValueFromRow[String]("countrycode", row) match {
+	    case Some("US") => getValueFromRow[String]("zipcode", row).map(_.take(5))
+	    case _ => getValueFromRow[String]("postalcode", row)
 	}
     }
 
     def getApplicantAddressTokens(row: org.apache.spark.sql.Row): Vector[String] = {
-	val addressComponents = for (column <- Vector("street1", "street2", "city")) yield row.getAs[String](column)
-
+	val addressComponents = for (column <- Vector("street1", "street2", "city")) yield getValueFromRow[String](column, row)
 	val addressComponentsAll = addressComponents :+ getApplicantPostalCode(row)
-	addressComponentsAll.filter(_ != null).map(s => s.toLowerCase.replace("[^a-z0-9]", "")).flatMap(NGramsLibSimple.tokens)
+	addressComponentsAll.map(s => s.toLowerCase.replace("[^a-z0-9]", "")).flatMap(NGramsLibSimple.tokens)
     }
 
-    case class ApplicantNGrams(name: Set[Vector[String]], address: Set[Vector[String]], state: String, country: String)
+    case class ApplicantNGrams(name: Set[Vector[String]], address: Set[Vector[String]], state: Option[String], country: Option[String])
 
     def getApplicantNGrams(row: org.apache.spark.sql.Row): ApplicantNGrams = {
 	val nGramsOrders = Set(1, 2)
 	val nameNGrams = NGramsLibSimple.uniqueNGrams(getApplicantNameTokens(row), nGramsOrders)
 	val addressNGrams = NGramsLibSimple.uniqueNGrams(getApplicantAddressTokens(row), nGramsOrders)
-	val state = row.getAs[String]("state")
-	val country = row.getAs[String]("countrycode")
+	val state = getValueFromRow[String]("state", row)
+	val country = getValueFromRow[String]("countrycode", row)
 	ApplicantNGrams(nameNGrams, addressNGrams, state, country)
     }
 
