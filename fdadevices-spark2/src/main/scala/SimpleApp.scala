@@ -8,6 +8,8 @@ import org.apache.spark.sql.SQLContext
 
 import scopt.OptionParser
 
+import scala.collection.JavaConverters._
+
 object SimpleApp {
   def main(args: Array[String]) {
     val config = parser.parse(args, Config())
@@ -21,11 +23,39 @@ object SimpleApp {
     val connInfo = Map("url" -> config.get.database, "dbtable" -> "applicant")
     val df = sqlContext.load("jdbc", connInfo)
 
-    val result = df.map(row => (row.getAs[Int]("applicantid"), getApplicantNGrams(row))).collect().toMap
+    val applicantNGrams = df.map(row => getApplicantNGrams(row)).collect().groupBy(_.zone)
+
+    //val indexPairs = sc.parallelize(applicantNGrams.values.toSeq, 6).flatMap(getIndexPairs).collect()
+    val indexPairs = applicantNGrams.values.toSeq.flatMap(getIndexPairs)
+    println(indexPairs.head)
+
+    val partSizes = applicantNGrams.keys.zip(applicantNGrams.values.map(_.size)).toMap
+    val numPairs = applicantNGrams.values.map(x => (0.5 * x.size * (x.size - 1))).reduceLeft(_ + _)
+
+    println(s"Pairs: $numPairs")
+    println(s"Sizes (min, max) = (${partSizes.values.min}, ${partSizes.values.max})")
+    println(partSizes)
+
+    val caUS = Zone(Option("CA"), Option("US"))
 
     for (i <- 1 to 10) {
-      println(result(i))
+
+      println(applicantNGrams(caUS)(i))
     }
+  }
+
+  def getIndexPairs(ngrams: Array[ApplicantNGrams]) = {
+    val pairs = (0 until ngrams.size).toSet.subsets(2)
+    for (p <- pairs) yield (ngrams(p.head).applicantid, ngrams(p.last).applicantid)
+  }
+
+  case class ApplicantSimilarity(applicantId1: Int, applicantId2: Int, similarity: Double)
+
+  def computeSimilarity(nGrams1: ApplicantNGrams, nGrams2: ApplicantNGrams): ApplicantSimilarity = {
+    val diceName = NGramsLibSimple.diceCoefficient(nGrams1.name, nGrams2.name)
+    val diceAddress = NGramsLibSimple.diceCoefficient(nGrams1.address, nGrams2.address)
+    val meanDice = 0.5 * diceName + 0.5 * diceAddress
+    ApplicantSimilarity(applicantId1=nGrams1.applicantid, applicantId2=nGrams2.applicantid, similarity=meanDice)
   }
 
   def getValueFromRow[T](columnName: String, row: org.apache.spark.sql.Row): Option[T] = {
@@ -56,15 +86,17 @@ object SimpleApp {
     x.flatMap(NGramsLibSimple.tokens)
   }
 
-  case class ApplicantNGrams(name: Set[Vector[String]], address: Set[Vector[String]], state: Option[String], country: Option[String])
+  case class Zone(state: Option[String], country: Option[String])
+  case class ApplicantNGrams(applicantid: Int, name: Set[Vector[String]], address: Set[Vector[String]], zone: Zone)
 
   def getApplicantNGrams(row: org.apache.spark.sql.Row): ApplicantNGrams = {
     val nGramsOrders = Set(1, 2)
     val nameNGrams = NGramsLibSimple.uniqueNGrams(getApplicantNameTokens(row), nGramsOrders)
     val addressNGrams = NGramsLibSimple.uniqueNGrams(getApplicantAddressTokens(row), nGramsOrders)
+    val id = row.getAs[Int]("applicantid")
     val state = getValueFromRow[String]("state", row)
     val country = getValueFromRow[String]("countrycode", row)
-    ApplicantNGrams(nameNGrams, addressNGrams, state, country)
+    ApplicantNGrams(id, nameNGrams, addressNGrams, Zone(state, country))
   }
 
   def ApplicantTokenMap(df: org.apache.spark.sql.DataFrame): Map[Int, ApplicantNGrams] = {
