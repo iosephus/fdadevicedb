@@ -66,6 +66,13 @@ class Applicant(Base):
     postalcode = sqla.Column(sqla.String(16))
     countrycode = sqla.Column(sqla.String(2))
 
+class ApplicantSimilarity(Base):
+    __tablename__ = 'applicant_similarity'
+    applicantid1 = sqla.Column(sqla.Integer)
+    applicantid2 = sqla.Column(sqla.Integer)
+    stype = sqla.Column(sqla.String)
+    value = sqla.Column(sqla.Double)
+
 class Contact(Base):
     __tablename__ = 'contact'
     contactid = sqla.Column(sqla.Integer, primary_key=True)

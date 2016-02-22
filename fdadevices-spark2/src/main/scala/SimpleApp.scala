@@ -5,11 +5,12 @@
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.{SaveMode, Row, SQLContext}
 import org.apache.spark.graphx._
 import org.apache.spark.rdd.RDD
 import org.apache.log4j.Logger
 import org.apache.log4j.Level
+import org.apache.spark.sql.types._
 
 import scopt.OptionParser
 
@@ -54,8 +55,18 @@ object SimpleApp {
 
     println(s"Similarity values: ${similarities.size}")
 
-    val applicants: RDD[(VertexId, Int)] = sc.parallelize(for (ng <- flatApplicantNGrams.value) yield (ng.applicantid.toLong, ng.applicantid))
-    val relationships: RDD[Edge[String]] = sc.parallelize(for (ng <- similarities if ng.similarity >= 0.7) yield Edge(ng.applicantId1, ng.applicantId2, "similarity"))
+    val applicants: RDD[(VertexId, Long)] = sc.parallelize(for (ng <- flatApplicantNGrams.value) yield (ng.applicantId.toLong, ng.applicantId))
+    val relationships: RDD[Edge[(String, Double)]] = sc.parallelize(for (ng <- similarities if ng.similarity >= 0.7) yield Edge(ng.applicantId1, ng.applicantId2, ("NameAddressNGramsMeanDice", ng.similarity)))
+
+    val similaritySchema = new StructType(Array(StructField("applicantid1", LongType, nullable=false), StructField("applicantid2", LongType, nullable=false), StructField("stype", StringType, nullable=false), StructField("value", DoubleType, nullable=false)))
+
+    val similarityRDD: RDD[Row] = sc.parallelize(for (ng <- similarities) yield Row(ng.applicantId1, ng.applicantId2, "NameAddressNGramsMeanDice", ng.similarity))
+    val similarityDF = sqlContext.createDataFrame(similarityRDD, similaritySchema)
+
+    val prop = new java.util.Properties
+    prop.setProperty("user", config.get.user)
+    prop.setProperty("password", config.get.password)
+    similarityDF.write.jdbc(config.get.database, "applicant_similarity", prop)
 
     val graph = Graph(applicants, relationships)
 
@@ -72,7 +83,7 @@ object SimpleApp {
     (for (p <- pairs) yield (p.head, p.last)).toVector
   }
 
-  case class ApplicantSimilarity(applicantId1: Int, applicantId2: Int, similarity: Double)
+  case class ApplicantSimilarity(applicantId1: Long, applicantId2: Long, similarity: Double)
 
   def computeSimilarity(nGrams: Broadcast[Vector[ApplicantNGrams]], indexPair: (Int, Int), nameThreshold: Double = 0.1, addressThreshold: Double = 0.1): Option[ApplicantSimilarity] = {
     val nGramsLocal = nGrams.value
@@ -88,7 +99,7 @@ object SimpleApp {
         None
       } else {
         val meanDice = 0.5 * diceName + 0.5 * diceAddress
-        Some(ApplicantSimilarity(applicantId1 = nGrams1.applicantid, applicantId2 = nGrams2.applicantid, similarity = meanDice))
+        Some(ApplicantSimilarity(applicantId1 = nGrams1.applicantId, applicantId2 = nGrams2.applicantId, similarity = meanDice))
       }
     }
   }
@@ -122,7 +133,7 @@ object SimpleApp {
   }
 
   case class Zone(state: Option[String], country: Option[String])
-  case class ApplicantNGrams(applicantid: Int, name: Set[Vector[String]], address: Set[Vector[String]], zone: Zone)
+  case class ApplicantNGrams(applicantId: Long, name: Set[Vector[String]], address: Set[Vector[String]], zone: Zone)
 
   def getApplicantNGrams(row: org.apache.spark.sql.Row): ApplicantNGrams = {
     val nGramsOrders = Set(1, 2)
@@ -145,6 +156,12 @@ object SimpleApp {
     opt[String]('d', "database") required() action { (x, c) =>
       c.copy(database = x)
     } text ("JDBC database URL (required)")
+    opt[String]('u', "user") required() action { (x, c) =>
+      c.copy(user = x)
+    } text ("JDBC database user (required)")
+    opt[String]('p', "password") required() action { (x, c) =>
+      c.copy(user = x)
+    } text ("JDBC database password (required)")
   }
 
   def time[A](f: => A) = {
@@ -155,5 +172,5 @@ object SimpleApp {
     ret
   }
 
-  case class Config(database: String = "")
+  case class Config(database: String = "", user: String = "", password: String = "")
 }
