@@ -8,10 +8,10 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.SQLContext
 import org.apache.spark.graphx._
 import org.apache.spark.rdd.RDD
+import org.apache.log4j.Logger
+import org.apache.log4j.Level
 
 import scopt.OptionParser
-
-import scala.collection.JavaConverters._
 
 object SimpleApp {
   def main(args: Array[String]) {
@@ -19,6 +19,9 @@ object SimpleApp {
 
     if (!config.isDefined)
       System.exit(1)
+
+    Logger.getLogger("org").setLevel(Level.WARN)
+    Logger.getLogger("akka").setLevel(Level.WARN)
 
     val conf = new SparkConf().setAppName("FDADevices")
     val sc = new SparkContext(conf)
@@ -51,20 +54,16 @@ object SimpleApp {
 
     println(s"Similarity values: ${similarities.size}")
 
-    for (i <- 1 to 10) {
-
-      //println(applicantNGrams(caUS)(i))
-      println(similarities(i))
-    }
-
     val applicants: RDD[(VertexId, Int)] = sc.parallelize(for (ng <- flatApplicantNGrams.value) yield (ng.applicantid.toLong, ng.applicantid))
-    val relationships: RDD[Edge[String]] = sc.parallelize(for (ng <- similarities) yield Edge(ng.applicantId1, ng.applicantId2, "similarity"))
+    val relationships: RDD[Edge[String]] = sc.parallelize(for (ng <- similarities if ng.similarity >= 0.7) yield Edge(ng.applicantId1, ng.applicantId2, "similarity"))
 
     val graph = Graph(applicants, relationships)
 
     val components = graph.connectedComponents()
 
     val graphMap = graph.vertices.leftJoin(components.vertices) { case (id, applicant, compid) => compid }.collect().groupBy(_._2)
+
+    println(s"Connected components: ${graphMap.size}")
 
   }
 
