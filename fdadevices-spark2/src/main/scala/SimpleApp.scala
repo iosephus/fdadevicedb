@@ -4,7 +4,10 @@
 
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.SQLContext
+import org.apache.spark.graphx._
+import org.apache.spark.rdd.RDD
 
 import scopt.OptionParser
 
@@ -21,41 +24,71 @@ object SimpleApp {
     val sc = new SparkContext(conf)
     val sqlContext = new SQLContext(sc)
     val connInfo = Map("url" -> config.get.database, "dbtable" -> "applicant")
-    val df = sqlContext.load("jdbc", connInfo)
+    println("Reading data")
+    val df = time { sqlContext.load("jdbc", connInfo) }
 
-    val applicantNGrams = df.map(row => getApplicantNGrams(row)).collect().groupBy(_.zone)
+
+    println("Partitioning by zone")
+    val applicantNGrams = time { df.map(row => getApplicantNGrams(row)).collect().groupBy(_.zone)}
 
     //val indexPairs = sc.parallelize(applicantNGrams.values.toSeq, 6).flatMap(getIndexPairs).collect()
-    val indexPairs = applicantNGrams.values.toSeq.flatMap(getIndexPairs)
-    println(indexPairs.head)
+    println("Computing index pairs")
+    val arrSizes = applicantNGrams.values.map(_.size).toVector
+    val groupOffsets = arrSizes.slice(0, arrSizes.size - 1).scanLeft(0)(_ + _)
+    println("Array sizes")
+    println(arrSizes)
+    println("Group offsets")
+    println(groupOffsets)
+    //val indexPairs = time { sc.parallelize(arrSizes.zip(groupOffsets), 64).flatMap({case (size, offset) => getIndexPairs(size, offset)}).collect() }
+    val indexPairs = time { arrSizes.zip(groupOffsets).flatMap({case (size, offset) => getIndexPairs(size, offset)}) }
 
-    val partSizes = applicantNGrams.keys.zip(applicantNGrams.values.map(_.size)).toMap
-    val numPairs = applicantNGrams.values.map(x => (0.5 * x.size * (x.size - 1))).reduceLeft(_ + _)
+    val flatApplicantNGrams = sc.broadcast(applicantNGrams.values.flatten.toVector)
+    println(s"flatApplicantNGrams size: ${flatApplicantNGrams.value.size}")
+    println(flatApplicantNGrams.value(0))
+    println("Computing similarities")
+    //val similarities = sc.parallelize(indexPairs.toSeq, 6).map(t => computeSimilarity(flatApplicantNGrams(t._1), flatApplicantNGrams(t._2))).collect()
+    val similarities = time { sc.parallelize(indexPairs.toSeq, 256).flatMap(p => computeSimilarity(flatApplicantNGrams, p)).collect() }
 
-    println(s"Pairs: $numPairs")
-    println(s"Sizes (min, max) = (${partSizes.values.min}, ${partSizes.values.max})")
-    println(partSizes)
-
-    val caUS = Zone(Option("CA"), Option("US"))
+    println(s"Similarity values: ${similarities.size}")
 
     for (i <- 1 to 10) {
 
-      println(applicantNGrams(caUS)(i))
+      //println(applicantNGrams(caUS)(i))
+      println(similarities(i))
     }
+
+    val applicants: RDD[(VertexId, Int)] = sc.parallelize(for (ng <- flatApplicantNGrams.value) yield (ng.applicantid.toLong, ng.applicantid))
+    val relationships: RDD[Edge[String]] = sc.parallelize(for (ng <- similarities) yield Edge(ng.applicantId1, ng.applicantId2, "similarity"))
+
+    val graph = Graph(applicants, relationships)
+
+    val components = graph.connectedComponents()
   }
 
-  def getIndexPairs(ngrams: Array[ApplicantNGrams]) = {
-    val pairs = (0 until ngrams.size).toSet.subsets(2)
-    for (p <- pairs) yield (ngrams(p.head).applicantid, ngrams(p.last).applicantid)
+  def getIndexPairs(size: Int, offset: Int = 0): Vector[(Int, Int)] = {
+    val pairs = (offset until offset + size).toSet.subsets(2)
+    (for (p <- pairs) yield (p.head, p.last)).toVector
   }
 
   case class ApplicantSimilarity(applicantId1: Int, applicantId2: Int, similarity: Double)
 
-  def computeSimilarity(nGrams1: ApplicantNGrams, nGrams2: ApplicantNGrams): ApplicantSimilarity = {
+  def computeSimilarity(nGrams: Broadcast[Vector[ApplicantNGrams]], indexPair: (Int, Int), nameThreshold: Double = 0.1, addressThreshold: Double = 0.1): Option[ApplicantSimilarity] = {
+    val nGramsLocal = nGrams.value
+    val (index1, index2) = indexPair
+    val nGrams1 = nGramsLocal(index1)
+    val nGrams2 = nGramsLocal(index2)
     val diceName = NGramsLibSimple.diceCoefficient(nGrams1.name, nGrams2.name)
-    val diceAddress = NGramsLibSimple.diceCoefficient(nGrams1.address, nGrams2.address)
-    val meanDice = 0.5 * diceName + 0.5 * diceAddress
-    ApplicantSimilarity(applicantId1=nGrams1.applicantid, applicantId2=nGrams2.applicantid, similarity=meanDice)
+    if (diceName <= nameThreshold) {
+      None
+    } else {
+      val diceAddress = NGramsLibSimple.diceCoefficient(nGrams1.address, nGrams2.address)
+      if (diceAddress <= addressThreshold) {
+        None
+      } else {
+        val meanDice = 0.5 * diceName + 0.5 * diceAddress
+        Some(ApplicantSimilarity(applicantId1 = nGrams1.applicantid, applicantId2 = nGrams2.applicantid, similarity = meanDice))
+      }
+    }
   }
 
   def getValueFromRow[T](columnName: String, row: org.apache.spark.sql.Row): Option[T] = {
@@ -110,6 +143,14 @@ object SimpleApp {
     opt[String]('d', "database") required() action { (x, c) =>
       c.copy(database = x)
     } text ("JDBC database URL (required)")
+  }
+
+  def time[A](f: => A) = {
+    val startTime = System.currentTimeMillis
+    val ret = f
+    val durationSeconds = (System.currentTimeMillis - startTime) / 1000
+    println(s"Took $durationSeconds seconds")
+    ret
   }
 
   case class Config(database: String = "")
