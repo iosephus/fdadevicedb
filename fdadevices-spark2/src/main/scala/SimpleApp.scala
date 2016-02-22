@@ -63,6 +63,9 @@ object SimpleApp {
     val graph = Graph(applicants, relationships)
 
     val components = graph.connectedComponents()
+
+    val graphMap = graph.vertices.leftJoin(components.vertices) { case (id, applicant, compid) => compid }.collect().groupBy(_._2)
+
   }
 
   def getIndexPairs(size: Int, offset: Int = 0): Vector[(Int, Int)] = {
