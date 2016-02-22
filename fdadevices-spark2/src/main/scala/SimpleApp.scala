@@ -66,7 +66,8 @@ object SimpleApp {
     val prop = new java.util.Properties
     prop.setProperty("user", config.get.user)
     prop.setProperty("password", config.get.password)
-    similarityDF.write.jdbc(config.get.database, "applicant_similarity", prop)
+    println("Writing similarity values to database")
+    time { similarityDF.write.jdbc(config.get.database, "applicant_similarity", prop) }
 
     val graph = Graph(applicants, relationships)
 
