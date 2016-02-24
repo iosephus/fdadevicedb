@@ -5,12 +5,13 @@
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.sql.{SaveMode, Row, SQLContext}
+import org.apache.spark.sql.{DataFrame, SaveMode, Row, SQLContext}
 import org.apache.spark.graphx._
 import org.apache.spark.rdd.RDD
 import org.apache.log4j.Logger
 import org.apache.log4j.Level
 import org.apache.spark.sql.types._
+import math._
 
 import scopt.OptionParser
 
@@ -24,67 +25,86 @@ object SimpleApp {
     Logger.getLogger("org").setLevel(Level.WARN)
     Logger.getLogger("akka").setLevel(Level.WARN)
 
+    val prop = new java.util.Properties
+    prop.setProperty("user", config.get.user)
+    prop.setProperty("password", config.get.password)
+
     val conf = new SparkConf().setAppName("FDADevices")
     val sc = new SparkContext(conf)
     val sqlContext = new SQLContext(sc)
-    val connInfo = Map("url" -> config.get.database, "dbtable" -> "applicant")
-    println("Reading data")
-    val df = time { sqlContext.load("jdbc", connInfo) }
+    println("Reading data from database")
+    val applicantDF = time { sqlContext.read.jdbc(config.get.database, "applicant", prop) }
+    println(s"Number of applicants in database: ${applicantDF.count()}")
 
-
-    println("Partitioning by zone")
-    val applicantNGrams = time { df.map(row => getApplicantNGrams(row)).collect().groupBy(_.zone)}
+    println("Grouping by zone")
+    val applicantNGrams = time { applicantDF.map(row => getApplicantNGrams(row)).collect().groupBy(_.zone)}
+    println(s"${applicantNGrams.size} zones found")
 
     //val indexPairs = sc.parallelize(applicantNGrams.values.toSeq, 6).flatMap(getIndexPairs).collect()
     println("Computing index pairs")
     val arrSizes = applicantNGrams.values.map(_.size).toVector
     val groupOffsets = arrSizes.slice(0, arrSizes.size - 1).scanLeft(0)(_ + _)
-    println("Array sizes")
-    println(arrSizes)
-    println("Group offsets")
-    println(groupOffsets)
-    //val indexPairs = time { sc.parallelize(arrSizes.zip(groupOffsets), 64).flatMap({case (size, offset) => getIndexPairs(size, offset)}).collect() }
     val indexPairs = time { arrSizes.zip(groupOffsets).flatMap({case (size, offset) => getIndexPairs(size, offset)}) }
+    println(s"${indexPairs.size} index pairs generated")
 
     val flatApplicantNGrams = sc.broadcast(applicantNGrams.values.flatten.toVector)
-    println(s"flatApplicantNGrams size: ${flatApplicantNGrams.value.size}")
-    println(flatApplicantNGrams.value(0))
     println("Computing similarities")
     //val similarities = sc.parallelize(indexPairs.toSeq, 6).map(t => computeSimilarity(flatApplicantNGrams(t._1), flatApplicantNGrams(t._2))).collect()
-    val similarities = time { sc.parallelize(indexPairs.toSeq, 256).flatMap(p => computeSimilarity(flatApplicantNGrams, p)).collect() }
+    val similarities = time { sc.parallelize(indexPairs.toSeq, min(indexPairs.size, 1024)).flatMap(p => computeSimilarity(flatApplicantNGrams, p)).collect() }
+    //val similarities = time { indexPairs.flatMap(p => computeSimilarity(flatApplicantNGrams, p)) }
 
-    println(s"Similarity values: ${similarities.size}")
+    println(s"Valid similarity values: ${similarities.size}")
 
-    val applicants: RDD[(VertexId, Long)] = sc.parallelize(for (ng <- flatApplicantNGrams.value) yield (ng.applicantId.toLong, ng.applicantId))
-    val relationships: RDD[Edge[(String, Double)]] = sc.parallelize(for (ng <- similarities if ng.similarity >= 0.7) yield Edge(ng.applicantId1, ng.applicantId2, ("NameAddressNGramsMeanDice", ng.similarity)))
+    val applicants: RDD[(VertexId, Long)] = sc.parallelize(for (ng <- flatApplicantNGrams.value) yield (ng.applicantId.toLong, ng.applicantId), 12)
+    val relationships: RDD[Edge[(String, Double)]] = sc.parallelize(for (ng <- similarities if ng.similarity >= 0.7) yield Edge(ng.applicantId1, ng.applicantId2, ("NameAddressNGramsMeanDice", ng.similarity)), 12)
 
     val similaritySchema = new StructType(Array(StructField("applicantid1", LongType, nullable=false), StructField("applicantid2", LongType, nullable=false), StructField("stype", StringType, nullable=false), StructField("value", DoubleType, nullable=false)))
-
-    val similarityRDD: RDD[Row] = sc.parallelize(for (ng <- similarities) yield Row(ng.applicantId1, ng.applicantId2, "NameAddressNGramsMeanDice", ng.similarity))
+    val similarityRDD: RDD[Row] = sc.parallelize(for (ng <- similarities) yield Row(ng.applicantId1, ng.applicantId2, "NameAddressNGramsMeanDice", ng.similarity), 12)
     val similarityDF = sqlContext.createDataFrame(similarityRDD, similaritySchema)
 
-    val prop = new java.util.Properties
-    prop.setProperty("user", config.get.user)
-    prop.setProperty("password", config.get.password)
     println("Writing similarity values to database")
-    time { similarityDF.write.jdbc(config.get.database, "applicant_similarity", prop) }
+    time { similarityDF.write.mode("Overwrite").jdbc(config.get.database, "applicant_similarity", prop) }
 
     val graph = Graph(applicants, relationships)
 
-    val components = graph.connectedComponents()
+    println("Computing connected components")
+    val components = time { graph.connectedComponents() }
 
-    val graphMap = graph.vertices.leftJoin(components.vertices) { case (id, applicant, compid) => compid }.collect().groupBy(_._2)
+    val componentMap = components.vertices.collect().groupBy({ case (vertex, comp) => comp })
+    println(componentMap)
 
-    println(s"Connected components: ${graphMap.size}")
+    println(s"Connected components: ${componentMap.size}")
 
+    val connectedComponentSchema =  new StructType(Array(StructField("applicantid", LongType, nullable=false), StructField("uapplicantid", LongType, nullable=false)))
+    val connectedComponentsDF = sqlContext.createDataFrame(for ((vertex, comp) <- components.vertices) yield Row(vertex.toLong, comp.toLong), connectedComponentSchema)
+
+    val applicantDF2 = applicantDF.join(connectedComponentsDF, "applicantid")
+    val uapplicantDF = applicantDF2.drop("applicantid").dropDuplicates(Array("uapplicantid"))
+
+    time { uapplicantDF.write.mode("Overwrite").jdbc(config.get.database, "uapplicant", prop) }
+    time { applicantDF2.write.mode("Overwrite").jdbc(config.get.database, "applicant2", prop) }
+
+    /* TODO!!!
+    val contactDF = sqlContext.read.jdbc(config.get.database, "contact", prop).withColumnRenamed("id", "applicantid_toremove")
+    val contactDF2 = contactDF.join(connectedComponentsDF, contactDF("applicantid_toremove") === connectedComponentsDF("applicantid"), "left").drop("applicantid_toremove")
+    val uContactDF = contactDF2.dropDuplicates(Array("contact", "uapplicantid")).withColumnRenamed("contactid", "ucontactid")
+    val contactDF3 = contactDF2.join(uContactDF, contactDF2("contact") === uContactDF("contact") && contactDF2("uapplicantid") === uContactDF("uapplicantid"), "left")
+    */
+
+    val pmnRequestDF = sqlContext.read.jdbc(config.get.database, "pmn_request", prop).withColumnRenamed("applicantid", "applicantid_toremove")
+    val pmnRequestDF2 = pmnRequestDF.join(connectedComponentsDF, pmnRequestDF("applicantid_toremove") === connectedComponentsDF("applicantid"), "left").drop("applicantid_toremove")
+    time { pmnRequestDF2.write.mode("Overwrite").jdbc(config.get.database, "pmn_request2", prop) }
   }
+
+  case class Config(database: String = "", user: String = "", password: String = "")
+  case class ApplicantSimilarity(applicantId1: Long, applicantId2: Long, similarity: Double)
+  case class Zone(state: Option[String], country: Option[String])
+  case class ApplicantNGrams(applicantId: Long, name: Set[Vector[String]], address: Set[Vector[String]], zone: Zone)
 
   def getIndexPairs(size: Int, offset: Int = 0): Vector[(Int, Int)] = {
     val pairs = (offset until offset + size).toSet.subsets(2)
     (for (p <- pairs) yield (p.head, p.last)).toVector
   }
-
-  case class ApplicantSimilarity(applicantId1: Long, applicantId2: Long, similarity: Double)
 
   def computeSimilarity(nGrams: Broadcast[Vector[ApplicantNGrams]], indexPair: (Int, Int), nameThreshold: Double = 0.1, addressThreshold: Double = 0.1): Option[ApplicantSimilarity] = {
     val nGramsLocal = nGrams.value
@@ -133,8 +153,6 @@ object SimpleApp {
     x.flatMap(NGramsLibSimple.tokens)
   }
 
-  case class Zone(state: Option[String], country: Option[String])
-  case class ApplicantNGrams(applicantId: Long, name: Set[Vector[String]], address: Set[Vector[String]], zone: Zone)
 
   def getApplicantNGrams(row: org.apache.spark.sql.Row): ApplicantNGrams = {
     val nGramsOrders = Set(1, 2)
@@ -151,6 +169,14 @@ object SimpleApp {
     df.map(row => (row.getAs[Int]("applicantid"), getApplicantNGrams(row))).collect().toMap
   }
 
+  def time[A](f: => A) = {
+    val startTime = System.currentTimeMillis
+    val ret = f
+    val durationSeconds = (System.currentTimeMillis - startTime) / 1000
+    println(s"Took $durationSeconds seconds")
+    ret
+  }
+
   val parser = new OptionParser[Config]("App") {
 
     head("App", "")
@@ -165,13 +191,4 @@ object SimpleApp {
     } text ("JDBC database password (required)")
   }
 
-  def time[A](f: => A) = {
-    val startTime = System.currentTimeMillis
-    val ret = f
-    val durationSeconds = (System.currentTimeMillis - startTime) / 1000
-    println(s"Took $durationSeconds seconds")
-    ret
-  }
-
-  case class Config(database: String = "", user: String = "", password: String = "")
 }
